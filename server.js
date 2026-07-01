@@ -14,7 +14,20 @@ const API_KEY = process.env.API_KEY || 'change-this-secret-key-123';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// type: () => true ép body-parser luôn parse JSON, bất kể Content-Type header
+// (plugin Java gửi "application/json; utf-8" — thiếu "charset=" nên không chuẩn HTTP,
+// khiến express.json() mặc định bỏ qua và req.body bị rỗng -> lỗi 400 "Missing items field")
+app.use(express.json({ limit: '10mb', type: () => true }));
+
+// Bắt lỗi parse JSON (nếu body gửi lên không phải JSON hợp lệ) để tránh crash server
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    console.error(`[JSON parse error] ${req.method} ${req.path} —`, err.message);
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+  next(err);
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Middleware xác thực API key ──────────────────────────────
