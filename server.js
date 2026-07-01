@@ -14,12 +14,10 @@ const API_KEY = process.env.API_KEY || 'change-this-secret-key-123';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ──────────────────────────────────────────────
-// Middleware xác thực API key (cho plugin gửi data lên)
-// ──────────────────────────────────────────────
+// ── Middleware xác thực API key ──────────────────────────────
 function requireApiKey(req, res, next) {
   const key = req.headers['x-api-key'];
   if (key !== API_KEY) {
@@ -28,129 +26,131 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ══════════════════════════════════════════════
-//  API ENDPOINTS — Dành cho Plugin gửi data lên
-// ══════════════════════════════════════════════
+// ── Debug middleware — log mọi request từ plugin ─────────────
+app.use('/api/sync', (req, res, next) => {
+  console.log(`[SYNC] ${req.method} ${req.path} — body keys: ${Object.keys(req.body || {}).join(', ')}`);
+  next();
+});
 
-// Plugin gửi snapshot giá hiện tại (mỗi 10s)
+// ══════════════════════════════════════════════════════════════
+//  API — Plugin gửi data lên
+// ══════════════════════════════════════════════════════════════
+
+// Nhận snapshot giá (mỗi 10 giây từ plugin)
 app.post('/api/sync/snapshot', requireApiKey, (req, res) => {
   try {
-    const { items } = req.body;
-    if (!items || !Array.isArray(items)) {
-      return res.status(400).json({ error: 'Invalid items array' });
+    const body = req.body;
+
+    // Hỗ trợ cả 2 format: { items: [...] } hoặc { items: {...} }
+    let items = body.items;
+
+    if (!items) {
+      console.warn('[SYNC] Không có field "items" trong body:', JSON.stringify(body).substring(0, 200));
+      return res.status(400).json({ error: 'Missing items field', received: Object.keys(body) });
+    }
+
+    // Nếu items là object (map) thay vì array → convert
+    if (!Array.isArray(items)) {
+      items = Object.values(items);
+    }
+
+    if (items.length === 0) {
+      return res.json({ success: true, itemsUpdated: 0, message: 'No items to update' });
     }
 
     db.saveSnapshot(items);
-
-    // Phát real-time tới mọi client đang xem web
     io.emit('priceUpdate', items);
 
+    console.log(`[SYNC] Snapshot OK — ${items.length} items`);
     res.json({ success: true, itemsUpdated: items.length });
+
   } catch (err) {
-    console.error('Error in /api/sync/snapshot:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[SYNC] Snapshot error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Plugin gửi danh sách giao dịch mới
+// Nhận danh sách giao dịch
 app.post('/api/sync/transactions', requireApiKey, (req, res) => {
   try {
-    const { transactions } = req.body;
-    if (!transactions || !Array.isArray(transactions)) {
-      return res.status(400).json({ error: 'Invalid transactions array' });
+    const body = req.body;
+    let transactions = body.transactions;
+
+    if (!transactions) {
+      return res.status(400).json({ error: 'Missing transactions field' });
     }
 
-    db.saveTransactions(transactions);
+    if (!Array.isArray(transactions)) {
+      transactions = Object.values(transactions);
+    }
 
-    // Phát real-time
-    io.emit('newTransactions', transactions);
+    if (transactions.length > 0) {
+      db.saveTransactions(transactions);
+      io.emit('newTransactions', transactions);
+    }
 
     res.json({ success: true, transactionsAdded: transactions.length });
+
   } catch (err) {
-    console.error('Error in /api/sync/transactions:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[SYNC] Transaction error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ══════════════════════════════════════════════
-//  API ENDPOINTS — Dành cho Website đọc data
-// ══════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+//  API — Website đọc data
+// ══════════════════════════════════════════════════════════════
 
-// Lấy toàn bộ danh sách item + giá hiện tại
 app.get('/api/items', (req, res) => {
-  try {
-    const items = db.getAllItems();
-    res.json(items);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  try { res.json(db.getAllItems()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Lấy chi tiết 1 item
 app.get('/api/items/:material', (req, res) => {
   try {
     const item = db.getItem(req.params.material.toUpperCase());
     if (!item) return res.status(404).json({ error: 'Item not found' });
     res.json(item);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Lấy lịch sử giá của 1 item (cho biểu đồ candlestick)
-// hours: số giờ muốn lấy lại (mặc định 24h)
 app.get('/api/items/:material/history', (req, res) => {
   try {
     const hours = parseInt(req.query.hours) || 24;
     const since = Date.now() - (hours * 60 * 60 * 1000);
-    const history = db.getPriceHistory(req.params.material.toUpperCase(), since);
-    res.json(history);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+    res.json(db.getPriceHistory(req.params.material.toUpperCase(), since));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Lấy giao dịch gần đây nhất (toàn server)
 app.get('/api/transactions', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
-    const transactions = db.getRecentTransactions(limit);
-    res.json(transactions);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+    res.json(db.getRecentTransactions(limit));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Lấy giao dịch của 1 item cụ thể
 app.get('/api/items/:material/transactions', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
-    const transactions = db.getItemTransactions(req.params.material.toUpperCase(), limit);
-    res.json(transactions);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+    res.json(db.getItemTransactions(req.params.material.toUpperCase(), limit));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Bảng xếp hạng item biến động giá nhiều nhất
 app.get('/api/top-movers', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 10;
-    const movers = db.getTopMovers(limit);
-    res.json(movers);
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
+    res.json(db.getTopMovers(limit));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ══════════════════════════════════════════════
-//  ADMIN ENDPOINTS — Đổi giá thủ công từ web
-// ══════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+//  ADMIN API
+// ══════════════════════════════════════════════════════════════
 
 app.post('/api/admin/login', (req, res) => {
   const { password } = req.body;
   if (password === ADMIN_PASSWORD) {
-    res.json({ success: true, token: API_KEY }); // đơn giản hoá — dùng chung API_KEY làm token
+    res.json({ success: true, token: API_KEY });
   } else {
     res.status(401).json({ error: 'Sai mật khẩu' });
   }
@@ -163,9 +163,8 @@ app.post('/api/admin/set-price', requireApiKey, (req, res) => {
       return res.status(400).json({ error: 'Thiếu thông tin' });
     }
 
-    // Cập nhật trực tiếp trong DB
     const item = db.getItem(material.toUpperCase());
-    if (!item) return res.status(404).json({ error: 'Item không tồn tại' });
+    if (!item) return res.status(404).json({ error: 'Item không tồn tại trong DB' });
 
     db.saveSnapshot([{
       item: material.toUpperCase(),
@@ -181,25 +180,21 @@ app.post('/api/admin/set-price', requireApiKey, (req, res) => {
     }]);
 
     io.emit('priceUpdate', [{ item: material.toUpperCase(), currentBuy: buyPrice, currentSell: sellPrice }]);
-
     res.json({ success: true });
+
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ──────────────────────────────────────────────
-// WebSocket connection
-// ──────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-  });
+  console.log('[WS] Client connected:', socket.id);
+  socket.on('disconnect', () => console.log('[WS] Client disconnected:', socket.id));
 });
 
-// Fallback — serve index.html cho mọi route khác (SPA)
+// ── Fallback SPA ──────────────────────────────────────────────
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
